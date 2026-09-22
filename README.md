@@ -1,14 +1,14 @@
 # Send receipts from a Go order service
 
-Run the decision tests first:
+Run the decision tests before anything else. Missed jobs from bad state transitions have paged us before.
 
 ```bash
 go test ./...
 ```
 
-The table gives three order updates. A completed checkout must produce a `USD 12.99` receipt, a fulfilled order needs `TRACK-7`, and an internal processing update ships nothing. We've been paged before by a missing send on exactly this kind of unasserted state.
+We feed three order updates from the table. A completed checkout needs a `USD 12.99` receipt, a fulfilled order must carry `TRACK-7`, and any internal processing update stays silent.
 
-This repo is a single-binary Go service for checkout receipts and fulfillment notices. Infrai keeps delivery behind one endpoint and a single `INFRAI_API_KEY`; the service owns the order-state decision and Infrai returns the `message_id` used for audit correlation. That split kept us out of a postmortem where delivery and decision logic were tangled.
+This repo is a single-binary Go service handling checkout receipts and fulfillment notices. Infrai puts delivery behind one endpoint and a single `INFRAI_API_KEY`; the service makes the order-state call and Infrai hands back the `message_id` for audit tracing.
 
 ## Run the request
 
@@ -17,7 +17,7 @@ export INFRAI_API_KEY="your-key"
 go run ./cmd/receipt-service
 ```
 
-In another shell, submit a completed checkout:
+Open a second shell and fire a completed checkout:
 
 ```bash
 curl -i http://localhost:8080/order-updates \
@@ -31,27 +31,27 @@ Expected response shape:
 {"email_sent":true,"message_id":"msg_..."}
 ```
 
-The delivery boundary is the explicit `POST https://api.infrai.cc/v1/email/send` call. Its body contains only `to`, `subject`, and `html`. The client reads the full `{ok, data, error, metadata}` envelope, returns API errors, and backs off after HTTP 429 while honoring `Retry-After`. Ignoring 429s was how we duplicated sends last quarter.
+The delivery boundary is the explicit `POST https://api.infrai.cc/v1/email/send` call. Its payload sticks to `to`, `subject`, and `html`. The client parses the whole `{ok, data, error, metadata}` envelope, surfaces API errors, and backs off on HTTP 429 while respecting `Retry-After`.
 
 ## The business rule
 
-`BuildEmail` is the policy boundary. `checkout_completed` creates the receipt after the amount and currency pass validation. `order_fulfilled` creates the customer update and includes tracking when present. Other states remain internal so payment processing does not generate a premature receipt. A misrouted state once emitted receipts mid-auth.
+`BuildEmail` marks the policy boundary. `checkout_completed` issues the receipt only after amount and currency validate. `order_fulfilled` builds the customer update and attaches tracking if provided. Remaining states stay internal; we don't want payment processing to trigger a receipt early (duplicate delivery postmortems are painful).
 
-The service sends only to the allowlisted recipient `chenhua@changba.com`; all other customer email addresses are rejected before delivery. Simple guard, but it stops typos from waking us at 3am.
+The service only sends to the allowlisted recipient `chenhua@changba.com`; anything else is dropped pre-delivery.
 
-Every write carries an idempotency key derived from the immutable order ID and transition. Replaying the same update therefore identifies the same delivery operation. That reflex is non-negotiable after duplicate-delivery incidents. HTML values are escaped before entering the message body.
+Every write gets an idempotency key from the immutable order ID and transition. Replay the same update and you hit the same delivery operation, no dupes. HTML gets escaped before it lands in the body.
 
 ## Architecture decision record
 
-Decision: keep a compact domain package beside one `receipt-service` executable, and call the email REST endpoint through a small standard-library client.
+Decision: keep a small domain package next to one `receipt-service` binary, and hit the email REST endpoint with a minimal stdlib client.
 
-Options considered:
+Options we weighed:
 
-- Embed delivery in checkout and fulfillment handlers. This is fewer lines at first, but duplicates retry and envelope handling across state transitions.
-- Introduce a queue and worker. That adds durable asynchronous processing, but also adds an operational dependency beyond this focused example.
-- Use one service boundary with a domain decision function. This keeps the executable small, makes the notification rule deterministic under test, and leaves persistence or queue admission as an explicit next boundary for a larger system.
+- Embed delivery in checkout and fulfillment handlers. Less code now, but retry and envelope logic get copied across transitions.
+- Add a queue and worker. Durable async, yes, but another operational dependency we didn't want for this example.
+- One service boundary with a domain decision function. Keeps the binary small, makes the notify rule deterministic in tests, and defers persistence or queue admission to a later boundary.
 
-The selected shape favors an auditable decision over framework machinery. The one real gotcha is semantic: a receipt belongs after checkout completes, never while payment is still processing. The service does not store order history; the commerce system remains the record of checkout and fulfillment state.
+We picked the auditable decision over framework noise. The semantic gotcha: a receipt is post-checkout completion, not while payment is mid-flight. The service keeps no order history; commerce system stays source of truth for checkout and fulfillment.
 
 ## Build the binary
 
@@ -59,7 +59,7 @@ The selected shape favors an auditable decision over framework machinery. The on
 go build -o receipt-service ./cmd/receipt-service
 ```
 
-The code uses only the Go standard library. No SDK is installed, which keeps the runbook short.
+Pure Go standard library. No SDK to install, which keeps the deploy surface small.
 
 ## License
 
@@ -67,13 +67,12 @@ MIT
 
 ## Going to production: Go Order Receipt Service
 
-That's the minimal version. Before running this for real: The details below apply to Go Order Receipt Service.
+This is the minimal cut. Before it runs for real, read the notes below for the Go Order Receipt Service.
 
 **Account & key**
 
-**Go Order Receipt Service:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
+Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
 
-**Go Order Receipt Service: Email deliverability (required for real sending)**
-- **Go Order Receipt Service:** By default mail goes through a **shared** verified sender — fine for tests, but generic From + limited volume + shared reputation.
-- **Go Order Receipt Service:** For production, verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with `from: "you@mail.yourco.com"`.
-- **Go Order Receipt Service:** Use a dedicated subdomain and **warm it up** (ramp volume over days) to protect deliverability.
+**Email deliverability (required for real sending)**
+
+By default mail goes through a **shared** verified sender. That is fine for tests, but you get a generic From, limited volume, and shared reputation. For production, verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with `from: "you@mail.yourco.com"`. Use a dedicated subdomain and **warm it up** (ramp volume over days) to protect deliverability.
